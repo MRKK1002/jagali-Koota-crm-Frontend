@@ -49,10 +49,15 @@ import {
   TrendingDown,
   Pencil,
   X,
+  Share2,
 } from "lucide-react";
 import axios from "axios";
 import { toast } from "react-toastify";
 import * as XLSX from "xlsx";
+import {
+  downloadPurchaseOrderPdf,
+  sharePurchaseOrderPdf,
+} from "@/utils/purchaseOrderPdf";
 
 const API_URL = import.meta.env.VITE_API_URL || "https://crm.jagalikoota.com/api/v1";
 // const API_URL = "https://crm.jagalikoota.com/api/v1";
@@ -149,6 +154,8 @@ const PurchaseManagement = () => {
   const [showViewGRNModal, setShowViewGRNModal] = useState(false);
   const [viewingGRN, setViewingGRN] = useState(null);
   const [editingGRN, setEditingGRN] = useState(null);
+  // Guards against double-submit (rapid clicks / retries) creating duplicate GRNs
+  const [grnSubmitting, setGrnSubmitting] = useState(false);
   const [selectedPO, setSelectedPO] = useState(null);
   const [grnForm, setGrnForm] = useState({
     grnNumber: "",
@@ -193,6 +200,9 @@ const PurchaseManagement = () => {
   const [uoms, setUoms] = useState([]);
   const [materialSearchTerm, setMaterialSearchTerm] = useState("");
   const [materialUnitFilter, setMaterialUnitFilter] = useState("all");
+  const [materialCategoryFilter, setMaterialCategoryFilter] = useState("all");
+  const [materialCategories, setMaterialCategories] = useState([]);
+  const [materialCategory, setMaterialCategory] = useState("");
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [materialToDelete, setMaterialToDelete] = useState(null);
   const [pendingPOs, setPendingPOs] = useState([]);
@@ -317,6 +327,7 @@ const PurchaseManagement = () => {
       if (categories.length === 0) background.push(fetchCategories());
       if (storeLocations.length === 0) background.push(fetchStoreLocations());
       if (uoms.length === 0) background.push(fetchUOMs());
+      if (materialCategories.length === 0) background.push(fetchMaterialCategories());
 
       // Heavy (217 KB). Needed to resolve item names in PO/GRN rows and to
       // power the material search in the PO modal — but never for first paint.
@@ -352,6 +363,17 @@ const PurchaseManagement = () => {
       setUoms(Array.isArray(data) ? data : []);
     } catch (err) {
       console.error("Error fetching UOMs:", err);
+    }
+  };
+
+  // Fetch raw material categories
+  const fetchMaterialCategories = async () => {
+    try {
+      const res = await axios.get(`${API_URL}/hotel/matCategory`);
+      const data = res.data.data || res.data || [];
+      setMaterialCategories(Array.isArray(data) ? data : []);
+    } catch (err) {
+      console.error("Error fetching material categories:", err);
     }
   };
 
@@ -412,7 +434,7 @@ const PurchaseManagement = () => {
           name: trimmedName,
           code: materialCode.trim(),
           unit: materialUnit.trim(),
-          category: existingMaterial?.category || "General",
+          category: materialCategory || existingMaterial?.category || "General",
           minLevel: existingMaterial?.minLevel || 5,
           suppliers: supplierEntries,
           description: existingMaterial?.description || "",
@@ -434,7 +456,7 @@ const PurchaseManagement = () => {
           name: trimmedName,
           code: materialCode.trim(),
           unit: materialUnit.trim(),
-          category: "General",
+          category: materialCategory || "General",
           minLevel: 5,
           description: "",
           suppliers: supplierEntries,
@@ -461,6 +483,7 @@ const PurchaseManagement = () => {
       setMaterialInput("");
       setMaterialCode("");
       setMaterialUnit("");
+      setMaterialCategory("");
       setMaterialDistributionUnit("");
       setMaterialConversionFactor("");
       setMaterialSelectedSuppliers([]);
@@ -527,6 +550,7 @@ const PurchaseManagement = () => {
     setMaterialInput(material.name);
     setMaterialCode(material.code || "");
     setMaterialUnit(material.unit || "");
+    setMaterialCategory(material.category || "");
     setMaterialDistributionUnit(material.distributionUnit || "");
     setMaterialConversionFactor(material.conversionFactor ? String(material.conversionFactor) : "");
     // Restore selected supplier IDs from existing supplier entries
@@ -550,6 +574,7 @@ const PurchaseManagement = () => {
     setMaterialInput("");
     setMaterialCode("");
     setMaterialUnit("");
+    setMaterialCategory("");
     setMaterialDistributionUnit("");
     setMaterialConversionFactor("");
     setMaterialSelectedSuppliers([]);
@@ -563,7 +588,9 @@ const PurchaseManagement = () => {
       (m.code && m.code.toLowerCase().includes(searchLower));
     const matchesUnit =
       materialUnitFilter === "all" || m.unit === materialUnitFilter;
-    return matchesSearch && matchesUnit;
+    const matchesCategory =
+      materialCategoryFilter === "all" || m.category === materialCategoryFilter;
+    return matchesSearch && matchesUnit && matchesCategory;
   });
 
   // Get unique units for filter
@@ -935,6 +962,35 @@ const PurchaseManagement = () => {
     }
   };
 
+  // ── Purchase Order PDF (vendor-facing) ───────────────────────────────────
+  // Deliberately excludes payment status, payment progress and GRN/invoice
+  // counts — those are internal tracking and must not go to the supplier.
+
+  const downloadPOPdf = async (po) => {
+    try {
+      await downloadPurchaseOrderPdf(po, suppliers);
+      toast.success("Purchase Order PDF downloaded");
+    } catch (err) {
+      console.error("PO PDF error:", err);
+      toast.error("Could not generate the PDF");
+    }
+  };
+
+  // Share via the native share sheet (WhatsApp / email on mobile & tablet).
+  // Falls back to a plain download where the Web Share API is unavailable.
+  const sharePOPdf = async (po) => {
+    try {
+      const how = await sharePurchaseOrderPdf(po, suppliers);
+      if (how === "downloaded") {
+        toast.info("Sharing isn't supported on this device — the PDF was downloaded instead");
+      }
+    } catch (err) {
+      if (err?.name === "AbortError") return; // user dismissed the share sheet
+      console.error("PO share error:", err);
+      toast.error("Could not share the PDF");
+    }
+  };
+
   const handleDeleteSupplier = async (id) => {
     if (!window.confirm("Are you sure you want to delete this supplier? This action cannot be undone.")) return;
     try {
@@ -1036,6 +1092,27 @@ const PurchaseManagement = () => {
       return;
     }
 
+    // Fetch last purchase rate for this material
+    axios
+      .get(`${API_URL}/restaurant/purchase-orders/last-rates`, {
+        params: { materialIds: material._id },
+      })
+      .then((res) => {
+        const rateInfo = res.data?.data?.[material._id];
+        if (rateInfo) {
+          setPoForm((prev) => {
+            const updated = [...prev.items];
+            const idx = updated.findIndex((it) => String(it.name) === String(material._id));
+            if (idx !== -1) {
+              updated[idx].previousRate = rateInfo.rate;
+              updated[idx].previousPO = rateInfo.poNumber;
+            }
+            return { ...prev, items: updated };
+          });
+        }
+      })
+      .catch(() => {});
+
     setPoForm((prev) => ({
       ...prev,
       items: [
@@ -1047,6 +1124,8 @@ const PurchaseManagement = () => {
           rate: "",
           tax: 0,
           amount: "",
+          previousRate: null,
+          previousPO: null,
         },
       ],
     }));
@@ -1224,6 +1303,9 @@ const PurchaseManagement = () => {
   };
   const handleGRNSubmit = async (e) => {
     e.preventDefault();
+    // Prevent duplicate submissions from rapid double-clicks or retries.
+    if (grnSubmitting) return;
+    setGrnSubmitting(true);
     try {
       // Validate that at least one item has received quantity
       const hasReceivedItems = grnForm.items.some(
@@ -1311,11 +1393,7 @@ const PurchaseManagement = () => {
         }
       });
 
-      console.log("GRN Payload:", JSON.stringify(payload, null, 2));
-      console.log("Items count:", payload.items?.length);
-      console.log("First item:", payload.items?.[0]);
-      console.log("PO Number in payload:", payload.poNumber);
-      console.log("PO ID in payload:", payload.poId);
+     
 
       if (editingGRN) {
         const response = await axios.put(`${API_URL}/hotel/grn/${editingGRN._id}`, payload);
@@ -1358,6 +1436,8 @@ const PurchaseManagement = () => {
       }
 
       toast.error(errorMessage);
+    } finally {
+      setGrnSubmitting(false);
     }
   };
   const resetGRNForm = () => {
@@ -1382,6 +1462,7 @@ const PurchaseManagement = () => {
     });
     setEditingGRN(null);
   };
+  
   return (
     <div className="p-6 space-y-6">
       <div className="flex items-center justify-between">
@@ -1593,7 +1674,7 @@ const PurchaseManagement = () => {
               </CardHeader>
               <CardContent>
                 <form onSubmit={handleMaterialSubmit} className="space-y-4">
-                  <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                  <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
                     <div className="space-y-2">
                       <Label
                         htmlFor="material-name"
@@ -1625,6 +1706,32 @@ const PurchaseManagement = () => {
                         onChange={(e) => setMaterialCode(e.target.value)}
                         className="w-full"
                       />
+                    </div>
+                    <div className="space-y-2">
+                      <Label
+                        htmlFor="material-category"
+                        className="text-sm font-medium"
+                      >
+                        Category <span className="text-red-500">*</span>
+                      </Label>
+                      <Select
+                        value={materialCategory}
+                        onValueChange={setMaterialCategory}
+                      >
+                        <SelectTrigger id="material-category" className="w-full">
+                          <SelectValue placeholder="Select category" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {materialCategories.map((cat) => (
+                            <SelectItem key={cat._id} value={cat.category}>
+                              {cat.category}
+                            </SelectItem>
+                          ))}
+                          {materialCategories.length === 0 && (
+                            <div className="px-2 py-1 text-sm text-gray-500">No categories. Add from below.</div>
+                          )}
+                        </SelectContent>
+                      </Select>
                     </div>
                     <div className="space-y-2">
                       <Label
@@ -1879,6 +1986,86 @@ const PurchaseManagement = () => {
               </CardContent>
             </Card>
 
+            {/* Manage Categories */}
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base">Manage Raw Material Categories</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="flex gap-2 mb-3">
+                  <Input
+                    placeholder="New category name (e.g., Frozen Food, Dairy, Spices)"
+                    className="max-w-xs"
+                    id="new-mat-category-input"
+                    onKeyDown={async (e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        const val = e.target.value.trim();
+                        if (!val) return;
+                        try {
+                          await axios.post(`${API_URL}/hotel/matCategory`, { category: val });
+                          toast.success("Category added!");
+                          e.target.value = "";
+                          fetchMaterialCategories();
+                        } catch (err) {
+                          toast.error(err.response?.data?.message || "Failed to add category");
+                        }
+                      }
+                    }}
+                  />
+                  <Button
+                    type="button"
+                    size="sm"
+                    className="bg-[#69231B] hover:bg-[#7a2920] text-white"
+                    onClick={async () => {
+                      const input = document.getElementById("new-mat-category-input");
+                      const val = input?.value?.trim();
+                      if (!val) return;
+                      try {
+                        await axios.post(`${API_URL}/hotel/matCategory`, { category: val });
+                        toast.success("Category added!");
+                        input.value = "";
+                        fetchMaterialCategories();
+                      } catch (err) {
+                        toast.error(err.response?.data?.message || "Failed to add category");
+                      }
+                    }}
+                  >
+                    <Plus className="w-4 h-4 mr-1" /> Add
+                  </Button>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {materialCategories.map((cat) => (
+                    <span
+                      key={cat._id}
+                      className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm bg-[#69231B]/10 text-[#69231B]"
+                    >
+                      {cat.category}
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          if (!window.confirm(`Delete category "${cat.category}"?`)) return;
+                          try {
+                            await axios.delete(`${API_URL}/hotel/matCategory/${cat._id}`);
+                            toast.success("Category removed");
+                            fetchMaterialCategories();
+                          } catch (err) {
+                            toast.error("Failed to delete category");
+                          }
+                        }}
+                        className="ml-1 text-red-500 hover:text-red-700"
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                  {materialCategories.length === 0 && (
+                    <p className="text-sm text-gray-500">No categories added yet.</p>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+
             {/* Search and Filter Card */}
             <Card>
               <CardHeader className="flex flex-row items-center justify-between">
@@ -1918,12 +2105,29 @@ const PurchaseManagement = () => {
                       ))}
                     </SelectContent>
                   </Select>
-                  {(materialSearchTerm || materialUnitFilter !== "all") && (
+                  <Select
+                    value={materialCategoryFilter}
+                    onValueChange={setMaterialCategoryFilter}
+                  >
+                    <SelectTrigger className="w-full sm:w-[180px]">
+                      <SelectValue placeholder="Filter by category" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All Categories</SelectItem>
+                      {materialCategories.map((cat) => (
+                        <SelectItem key={cat._id} value={cat.category}>
+                          {cat.category}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {(materialSearchTerm || materialUnitFilter !== "all" || materialCategoryFilter !== "all") && (
                     <Button
                       variant="outline"
                       onClick={() => {
                         setMaterialSearchTerm("");
                         setMaterialUnitFilter("all");
+                        setMaterialCategoryFilter("all");
                       }}
                     >
                       Clear Filters
@@ -1960,6 +2164,7 @@ const PurchaseManagement = () => {
                           <TableHead className="font-semibold">
                             Material Name
                           </TableHead>
+                          <TableHead className="font-semibold">Category</TableHead>
                           <TableHead className="font-semibold">Unit</TableHead>
                           <TableHead className="font-semibold">Distribution Unit</TableHead>
                           <TableHead className="font-semibold">Suppliers</TableHead>
@@ -1983,6 +2188,11 @@ const PurchaseManagement = () => {
                             </TableCell>
                             <TableCell className="font-medium">
                               {m.name}
+                            </TableCell>
+                            <TableCell>
+                              <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
+                                {m.category || "—"}
+                              </span>
                             </TableCell>
                             <TableCell>
                               <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
@@ -2300,6 +2510,8 @@ const PurchaseManagement = () => {
                                         rate: item.rate || "",
                                         tax: item.tax ?? 0,
                                         amount: item.amount || "",
+                                        previousRate: null,
+                                        previousPO: null,
                                       })) || [],
                                     notes: poData.notes || "",
                                     paymentTerms: poData.paymentTerms || "30",
@@ -2321,6 +2533,25 @@ const PurchaseManagement = () => {
                                 title="View Details"
                               >
                                 <Eye className="h-4 w-4" />
+                              </Button>
+                              {/* Vendor-facing PO PDF — download / share */}
+                              <Button
+                                variant="outline"
+                                size="icon"
+                                onClick={() => downloadPOPdf(po)}
+                                title="Download PO as PDF"
+                                aria-label={`Download purchase order ${po.purchaseOrderId || ""} as PDF`}
+                              >
+                                <FileText className="h-4 w-4" />
+                              </Button>
+                              <Button
+                                variant="outline"
+                                size="icon"
+                                onClick={() => sharePOPdf(po)}
+                                title="Share PO PDF with supplier"
+                                aria-label={`Share purchase order ${po.purchaseOrderId || ""} with supplier`}
+                              >
+                                <Share2 className="h-4 w-4" />
                               </Button>
                               <Button
                                 variant="destructive"
@@ -3313,11 +3544,14 @@ const PurchaseManagement = () => {
                 type="button"
                 variant="outline"
                 onClick={() => setShowGRNModal(false)}
+                disabled={grnSubmitting}
               >
                 Cancel
               </Button>
-              <Button type="submit">
-                {editingGRN ? "Update GRN" : "Create GRN"}
+              <Button type="submit" disabled={grnSubmitting}>
+                {grnSubmitting
+                  ? (editingGRN ? "Updating..." : "Creating...")
+                  : (editingGRN ? "Update GRN" : "Create GRN")}
               </Button>
             </DialogFooter>
           </form>
@@ -4106,27 +4340,49 @@ const PurchaseManagement = () => {
                       />
                       
                       {/* Rate */}
-                      <Input
-                        type="number"
-                        placeholder="Rate"
-                        min="0"
-                        step="any"
-                        value={item.rate}
-                        onChange={(e) => {
-                          const raw = e.target.value;
-                          // Block negative rates for the same reason as qty
-                          if (raw !== "" && parseFloat(raw) < 0) return;
-                          const updatedItems = [...poForm.items];
-                          updatedItems[index].rate = raw;
-                          const qty = parseFloat(updatedItems[index].quantity) || 0;
-                          const rate = parseFloat(raw) || 0;
-                          const taxPercent = parseFloat(updatedItems[index].tax) || 0;
-                          const baseAmount = qty * rate;
-                          const taxAmount = baseAmount * (taxPercent / 100);
-                          updatedItems[index].amount = (baseAmount + taxAmount).toFixed(2);
-                          setPoForm({ ...poForm, items: updatedItems });
-                        }}
-                      />
+                      <div className="flex flex-col">
+                        <Input
+                          type="number"
+                          placeholder="Rate"
+                          min="0"
+                          step="any"
+                          value={item.rate}
+                          onChange={(e) => {
+                            const raw = e.target.value;
+                            // Block negative rates for the same reason as qty
+                            if (raw !== "" && parseFloat(raw) < 0) return;
+                            const updatedItems = [...poForm.items];
+                            updatedItems[index].rate = raw;
+                            const qty = parseFloat(updatedItems[index].quantity) || 0;
+                            const rate = parseFloat(raw) || 0;
+                            const taxPercent = parseFloat(updatedItems[index].tax) || 0;
+                            const baseAmount = qty * rate;
+                            const taxAmount = baseAmount * (taxPercent / 100);
+                            updatedItems[index].amount = (baseAmount + taxAmount).toFixed(2);
+                            setPoForm({ ...poForm, items: updatedItems });
+                          }}
+                        />
+                        {item.previousRate != null && (
+                          <button
+                            type="button"
+                            className="text-xs text-blue-600 hover:text-blue-800 hover:underline mt-0.5 text-left cursor-pointer"
+                            onClick={() => {
+                              const updatedItems = [...poForm.items];
+                              updatedItems[index].rate = item.previousRate;
+                              const qty = parseFloat(updatedItems[index].quantity) || 0;
+                              const rate = parseFloat(item.previousRate) || 0;
+                              const taxPercent = parseFloat(updatedItems[index].tax) || 0;
+                              const baseAmount = qty * rate;
+                              const taxAmount = baseAmount * (taxPercent / 100);
+                              updatedItems[index].amount = (baseAmount + taxAmount).toFixed(2);
+                              setPoForm({ ...poForm, items: updatedItems });
+                            }}
+                            title="Click to use this rate"
+                          >
+                            Prev: ₹{item.previousRate}
+                          </button>
+                        )}
+                      </div>
                       
                       {/* Tax */}
                       <Input
@@ -4593,6 +4849,18 @@ const PurchaseManagement = () => {
               Close
             </Button>
             {viewingPO && (
+              <>
+                <Button variant="outline" onClick={() => downloadPOPdf(viewingPO)}>
+                  <FileText className="h-4 w-4 mr-2" />
+                  Download PDF
+                </Button>
+                <Button variant="outline" onClick={() => sharePOPdf(viewingPO)}>
+                  <Share2 className="h-4 w-4 mr-2" />
+                  Share
+                </Button>
+              </>
+            )}
+            {viewingPO && (
               <Button
                 onClick={() => {
                   setShowViewModal(false);
@@ -4628,6 +4896,8 @@ const PurchaseManagement = () => {
                         rate: item.rate || "",
                         tax: item.tax ?? 0,
                         amount: item.amount || "",
+                        previousRate: null,
+                        previousPO: null,
                       })) || [],
                     notes: viewingPO.notes || "",
                     paymentTerms: viewingPO.paymentTerms || "30",
@@ -4719,4 +4989,5 @@ const PurchaseManagement = () => {
     </div>
   );
 };
+
 export default PurchaseManagement;

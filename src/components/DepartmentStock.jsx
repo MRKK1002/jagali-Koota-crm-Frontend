@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, Fragment } from "react";
 import axios from "axios";
 import { toast } from "react-toastify";
 import { Package, Search, RefreshCw, AlertTriangle } from "lucide-react";
@@ -18,15 +18,21 @@ const DepartmentStock = () => {
   const [selectedBranch, setSelectedBranch] = useState("");
   const [searchTerm, setSearchTerm] = useState("");
   const [showLogs, setShowLogs] = useState(false);
+  // "department|branch|rawMaterialId" -> [{ date, quantity, unit, indentNumber }]
+  const [receiptHistory, setReceiptHistory] = useState({});
+  // which row is expanded to show its full arrival history
+  const [expandedKey, setExpandedKey] = useState(null);
 
   useEffect(() => {
     fetchDepartments();
     fetchBranches();
     fetchAllStock();
+    fetchReceiptHistory();
   }, []);
 
   useEffect(() => {
     fetchAllStock();
+    fetchReceiptHistory();
   }, [selectedDept, selectedBranch]);
 
   const fetchDepartments = async () => {
@@ -63,6 +69,33 @@ const DepartmentStock = () => {
       setLoading(false);
     }
   };
+
+  // Arrival history is derived server-side from the indents that credited the stock.
+  const fetchReceiptHistory = async () => {
+    try {
+      const params = new URLSearchParams();
+      if (selectedDept) params.append("department", selectedDept);
+      if (selectedBranch) params.append("branch", selectedBranch);
+      const res = await axios.get(
+        `${API_BASE}/department-stock/receipt-history?${params.toString()}`
+      );
+      setReceiptHistory(res.data?.data || {});
+    } catch (err) {
+      console.error("Failed to fetch stock receipt history:", err);
+    }
+  };
+
+  // Look up a stock row's arrival history. rawMaterial may be an id string or a populated object.
+  const historyFor = (stock) => {
+    const rmId =
+      typeof stock.rawMaterial === "object" && stock.rawMaterial !== null
+        ? stock.rawMaterial._id
+        : stock.rawMaterial;
+    return receiptHistory[`${stock.department}|${stock.branch}|${rmId}`] || [];
+  };
+
+  const fmtDate = (d) =>
+    d ? new Date(d).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) : "-";
 
   const fetchConsumptionLogs = async () => {
     try {
@@ -189,15 +222,33 @@ const DepartmentStock = () => {
                       <th className="p-3 text-left font-semibold">Quantity</th>
                       <th className="p-3 text-left font-semibold">Unit</th>
                       <th className="p-3 text-left font-semibold">Branch</th>
-                      <th className="p-3 text-left font-semibold">Last Issued</th>
+                      <th className="p-3 text-left font-semibold">First Received</th>
+                      <th className="p-3 text-left font-semibold">Latest Received</th>
+                      <th className="p-3 text-left font-semibold">Times</th>
                     </tr>
                   </thead>
                   <tbody>
                     {items
                       .filter(s => s.productName?.toLowerCase().includes(searchTerm.toLowerCase()))
-                      .map((stock, idx) => (
-                      <tr key={idx} className="border-b hover:bg-gray-50">
-                        <td className="p-3 font-medium">{stock.productName}</td>
+                      .map((stock, idx) => {
+                        const hist = historyFor(stock);
+                        const first = hist[0];
+                        const latest = hist[hist.length - 1];
+                        const rowKey = `${dept}|${stock.productName}|${idx}`;
+                        const isOpen = expandedKey === rowKey;
+                        return (
+                      <Fragment key={rowKey}>
+                      <tr
+                        className={`border-b hover:bg-gray-50 ${hist.length > 0 ? "cursor-pointer" : ""}`}
+                        onClick={() => hist.length > 0 && setExpandedKey(isOpen ? null : rowKey)}
+                        title={hist.length > 0 ? "Click to see all arrival dates" : ""}
+                      >
+                        <td className="p-3 font-medium">
+                          {hist.length > 1 && (
+                            <span className="mr-1 text-gray-400 text-xs">{isOpen ? "▾" : "▸"}</span>
+                          )}
+                          {stock.productName}
+                        </td>
                         <td className="p-3">
                           <span className={`px-2 py-1 rounded-full text-xs font-semibold ${
                             stock.quantity <= 0 ? "bg-red-100 text-red-700" :
@@ -210,11 +261,66 @@ const DepartmentStock = () => {
                         <td className="p-3 text-gray-600">{stock.unit}</td>
                         <td className="p-3 text-gray-600">{stock.branch}</td>
                         <td className="p-3 text-gray-500 text-xs">
-                          {stock.lastIssuedAt ? new Date(stock.lastIssuedAt).toLocaleDateString("en-IN") : "-"}
-                          {stock.lastIssuedQuantity ? ` (+${stock.lastIssuedQuantity})` : ""}
+                          {first ? (
+                            <>
+                              {fmtDate(first.date)}
+                              <span className="text-green-700 font-medium"> (+{first.quantity})</span>
+                            </>
+                          ) : "-"}
+                        </td>
+                        <td className="p-3 text-gray-500 text-xs">
+                          {latest && hist.length > 1 ? (
+                            <>
+                              {fmtDate(latest.date)}
+                              <span className="text-green-700 font-medium"> (+{latest.quantity})</span>
+                            </>
+                          ) : hist.length === 1 ? (
+                            <span className="text-gray-400">same</span>
+                          ) : "-"}
+                        </td>
+                        <td className="p-3 text-gray-600 text-xs">
+                          {hist.length > 0 ? `${hist.length}x` : "-"}
                         </td>
                       </tr>
-                    ))}
+                      {isOpen && hist.length > 0 && (
+                        <tr className="bg-gray-50 border-b">
+                          <td colSpan={7} className="p-3">
+                            <div className="text-xs font-semibold text-gray-700 mb-2">
+                              Stock arrivals for {stock.productName} — {dept}
+                            </div>
+                            <table className="w-full text-xs">
+                              <thead>
+                                <tr className="text-gray-500 border-b">
+                                  <th className="text-left py-1 pr-4">Date</th>
+                                  <th className="text-left py-1 pr-4">Quantity</th>
+                                  <th className="text-left py-1 pr-4">Indent</th>
+                                  <th className="text-left py-1">Running Total</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {hist.map((h, hi) => {
+                                  const running = hist
+                                    .slice(0, hi + 1)
+                                    .reduce((s, x) => s + Number(x.quantity || 0), 0);
+                                  return (
+                                    <tr key={hi} className="border-b last:border-0">
+                                      <td className="py-1 pr-4">{fmtDate(h.date)}</td>
+                                      <td className="py-1 pr-4 text-green-700 font-medium">
+                                        +{h.quantity} {h.unit}
+                                      </td>
+                                      <td className="py-1 pr-4 text-gray-600">{h.indentNumber}</td>
+                                      <td className="py-1 font-medium">{running}</td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </td>
+                        </tr>
+                      )}
+                      </Fragment>
+                        );
+                      })}
                   </tbody>
                 </table>
               </div>

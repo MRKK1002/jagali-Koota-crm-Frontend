@@ -275,7 +275,7 @@ const MenuItemForm = ({
       <p className="mt-1 text-xs text-gray-500">
         {existingImageUrl && !formData.image 
           ? "Upload a new image to replace the current one (optional)" 
-          : "Upload an image for this menu item (JPEG, PNG, GIF, WEBP, AVIF up to 5MB)"}
+          : "Upload an image for this menu item (JPEG, PNG, GIF, WEBP, AVIF up to 1MB)"}
       </p>
     </div>
 
